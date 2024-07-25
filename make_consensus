@@ -1,0 +1,274 @@
+#!/bin/bash
+
+print_help () {
+    echo -e "USAGE: "
+    echo -e "./make_consensus [options] -t TABLE.tsv -q FASTQ_DIR -r REFERENCE.fasta -o OUTPUT.fasta"
+    echo -e ""
+    echo -e "Required:"
+    echo -e "\t-t/--table: barcode and sample name table (must be tab separated)"
+    echo -e "\t-q/--fastq: folder with FASTQ to analyse (all files in folder will be consider)"
+    echo -e "\t-r/--reference: FASTA to compare with"
+    echo -e "\t-o/--output: Name for all output files"
+    echo -e "Optional:"
+    echo -e "\t-c/--coverage: minimun number of reads required to call consensus and variants (default: 20)"
+    echo -e "\t-p/--primers: BED file with primers coordinates"
+    echo -e "\t-m/--model: medaka model (default: r941_min_sup_g351)"
+    echo -e "\t--min_len: minimum read length to be considered (default: 1000)"
+    echo -e "\t--max_len: maximum read length to be considered (default: 2000)"
+    echo -e "\t-n/--threads: number of threads to use (default: 1)"
+    echo -e "\t-w/--workdir: folder to store all partial results (default: ./work)"
+    echo -e "\t-v/--verbose (default: Don't print anything)"
+    exit 4    
+    }
+
+# Read parameters
+if [[ $# -eq 0 ]]; then
+    print_help;
+    exit 4;
+fi
+
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        # Required
+        -t|--table)
+            IN_TABLE="$2"
+            shift
+            shift
+            ;;
+        -q|--fastq)
+            IN_FASTQ="$2"
+            shift
+            shift
+            ;;
+        -r|--reference)
+            REFERENCE="$2"
+            shift
+            shift
+            ;;
+        -o|--output)
+            OUTPUT="$2"
+            shift
+            shift
+            ;;
+
+        # Optional
+        -w|--workdir)
+            WORK_DIR="$2"
+            shift
+            shift
+            ;;
+        -p|--primers)
+            PRIMERS="$2"
+            shift
+            shift
+            ;;
+        --min_len)
+            MIN_LEN="$2"
+            shift
+            shift
+            ;;
+        --max_len)
+            MAX_LEN="$2"
+            shift
+            shift
+            ;;
+        -n|--threads)
+            PROCESADORES="$2"
+            shift
+            shift
+            ;;
+        -c|--coverage)
+            COVERAGE="$2"
+            shift
+            shift
+            ;;
+        -m|--model)
+            MODEL="$2"
+            shift
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        *)    # unknown option
+            echo "Unknow option: $key"
+            print_help
+            exit 4
+            ;;
+        esac
+done
+
+# Complete_defaults
+
+# Output
+if [[ -z "$OUTPUT" ]]; then
+    echo "ERROR: you must provide an output file.";
+    exit 4;
+fi
+# Samples table
+if [[ -z "$IN_TABLE" ]]; then
+    echo "ERROR: you must provide a samples table.";
+    exit 4;
+fi
+if [[ ! -f "$IN_TABLE" ]]; then
+    echo "ERROR: samples table not found.";
+    exit 4;
+fi
+# FASTQ
+if [[ -z "$IN_FASTQ" ]]; then
+    echo "ERROR: you must provide a FASTQ folder.";
+    exit 4;
+fi
+if [[ ! -d "$IN_FASTQ" ]]; then
+    echo "ERROR: FASTQ folder not found.";
+    exit 4;
+fi
+# Reference
+if [[ -z "$REFERENCE" ]]; then
+    echo "ERROR: you must provide a reference in FASTA format.";
+    exit 4;
+fi
+if [[ ! -f "$REFERENCE" ]]; then
+    echo "ERROR: reference file not found.";
+    exit 4;
+fi
+
+# Optionals
+if [[ -z "$COVERAGE" ]]; then
+    COVERAGE=20
+fi
+if [[ -z "$THREADS" ]]; then
+    THREADS=1
+fi
+if [[ -z "$MIN_LEN" ]]; then
+    MIN_LEN=1000
+fi
+if [[ -z "$MAX_LEN" ]]; then
+    MAX_LEN=2000
+fi
+if [[ -z "$MODEL" ]]; then
+    MODEL="r941_min_high_g360"
+fi
+if [[ -z "$WORK_DIR" ]]; then
+    WORK_DIR="work"
+fi
+if [[ -z "$PRIMERS" ]]; then
+    PRIMERS="NULL"
+fi
+if [[ -z "$VERBOSE" ]]; then
+    VERBOSE=0
+fi
+
+# Checking dependencies
+
+if ! command -v minimap2 &> /dev/null; then
+    echo "Error: minimap2 not installed"
+    exit 4
+fi
+if ! command -v samtools &> /dev/null; then
+    echo "Error: samtools not installed"
+    exit 4
+fi
+if ! command -v medaka &> /dev/null; then
+    echo "Error: medaka not installed"
+    exit 4
+fi
+if ! command -v bcftools &> /dev/null; then
+    echo "Error: bcftools not installed"
+    exit 4
+fi
+if ! command -v longshot &> /dev/null; then
+    echo "Error: longshot not installed"
+    exit 4
+fi
+if ! command -v bgzip &> /dev/null; then
+    echo "Error: bgzip not installed"
+    exit 4
+fi
+if ! command -v tabix &> /dev/null; then
+    echo "Error: tabix not installed"
+    exit 4
+fi
+
+# Setting some folders and variables
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+mkdir $WORK_DIR
+mkdir $WORK_DIR/filtered
+mkdir $WORK_DIR/mapping
+
+
+# Filtering reads
+if [[ "$VERBOSE" == 1 ]]; then
+    echo "Filtering reads"
+fi
+$SCRIPT_DIR/scripts/parse_fastq.py -i $IN_FASTQ -o $WORK_DIR/filtered --min_len $MIN_LEN --max_len $MAX_LEN -p $OUTPUT.svg
+
+printf "ID\tLength\tLength (N stripped)\t# Ns\tNs (percentage)\tMean Coverage\n" > $OUTPUT.stats.tsv
+
+# Let's the mapping begin
+if [[ "$VERBOSE" == 1 ]]; then
+    echo "Consensus"
+fi
+
+while read -r barcode sample; do
+
+    if [[ "$VERBOSE" == 1 ]]; then
+        echo "Working on sample $sample"
+    fi
+
+    # Mapping against reference
+    if [[ "$VERBOSE" == 1 ]]; then
+        echo -e "....Mapping"
+    fi
+    minimap2 -a -x map-ont -t $THREADS $REFERENCE $WORK_DIR/filtered/$barcode.fastq 2> /dev/null | samtools view -bS -F 4 - | samtools sort -o $WORK_DIR/mapping/$barcode.sorted.bam -
+    samtools index $WORK_DIR/mapping/$barcode.sorted.bam
+
+    # Normalize coverage and trim primers
+    python3 $SCRIPT_DIR/scripts/trim_and_normalize.py -i $WORK_DIR/mapping/$barcode.sorted.bam -o $WORK_DIR/mapping/$barcode.trimmed.bam -p $PRIMERS
+    samtools index $WORK_DIR/mapping/$barcode.trimmed.bam
+
+    # Variant calling    
+    if [[ "$VERBOSE" == 1 ]]; then
+        echo -e "....Medaka consensus" 
+    fi
+    medaka consensus --quiet --model $MODEL --threads $THREADS --chunk_len 800 --chunk_ovlp 400 $WORK_DIR/mapping/$barcode.trimmed.bam $WORK_DIR/mapping/$barcode.medaka.hdf 2> /dev/null
+
+    if [[ "$VERBOSE" == 1 ]]; then
+        echo -e "....Medaka variant" 
+    fi
+    medaka variant $REFERENCE $WORK_DIR/mapping/$barcode.medaka.hdf $WORK_DIR/mapping/$barcode.vcf 2> /dev/null
+    bgzip $WORK_DIR/mapping/$barcode.vcf
+    tabix -p vcf $WORK_DIR/mapping/$barcode.vcf.gz
+
+    if [[ "$VERBOSE" == 1 ]]; then
+        echo -e "....Longshot" 
+    fi
+    longshot -P 0.01 -F -A --no_haps --bam  $WORK_DIR/mapping/$barcode.trimmed.bam --ref $REFERENCE --out $WORK_DIR/mapping/$barcode.longshot.vcf --potential_variants $WORK_DIR/mapping/$barcode.vcf.gz 2> /dev/null
+    python3 $SCRIPT_DIR/scripts/parse_vcf.py -i $WORK_DIR/mapping/$barcode.longshot.vcf -f $WORK_DIR/mapping/$barcode.failed.vcf -p $WORK_DIR/mapping/$barcode.passed.vcf -t $COVERAGE
+
+    bgzip $WORK_DIR/mapping/$barcode.longshot.vcf
+    bgzip $WORK_DIR/mapping/$barcode.passed.vcf
+    tabix -p vcf $WORK_DIR/mapping/$barcode.passed.vcf.gz
+
+    python3 $SCRIPT_DIR/scripts/mask_low_coverage.py -i $WORK_DIR/mapping/$barcode.trimmed.bam -o $WORK_DIR/mapping/$barcode.mask.txt -c $COVERAGE
+
+    # Obtain consensus
+    if [[ "$VERBOSE" == 1 ]]; then
+        echo -e "....Final consensus"
+    fi
+    bcftools consensus -f $REFERENCE $WORK_DIR/mapping/$barcode.passed.vcf.gz -o $WORK_DIR/consensus.fasta -m $WORK_DIR/mapping/$barcode.mask.txt 2> /dev/null
+
+    # Rename resultaing genome and add it to the final file
+    sed -i "s/^>.*$/>$sample/" $WORK_DIR/consensus.fasta
+    cat $WORK_DIR/consensus.fasta >> $OUTPUT.fasta
+
+    # Some statistics of the consensus
+    MEAN_COV=$(samtools mpileup $WORK_DIR/mapping/$barcode.sorted.bam 2> /dev/null | awk '{ c+=$4} END { print c/NR } ');
+    STATS=$(python3 $SCRIPT_DIR/scripts/ns.py $WORK_DIR/consensus.fasta)
+    printf "$STATS\t$MEAN_COV\n" >> $OUTPUT.stats.tsv
+    rm $WORK_DIR/consensus.fasta
+    gzip $WORK_DIR/filtered/$barcode.fastq
+done < $IN_TABLE
+
