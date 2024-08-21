@@ -9,6 +9,8 @@ from Bio import SeqIO
 import re
 import json
 import sys
+import argparse
+import os
 
 __author__ = "Hernán Bernal"
 
@@ -32,6 +34,7 @@ class Codon:
         """
         self.sequence = sequence
         self.position = position
+        self.amino_acid = str(Seq(sequence).translate())
 
     def compare(self, other: "Codon") -> Tuple[str]:
         """
@@ -70,16 +73,11 @@ class Codon:
         if len(self.sequence) != len(other.sequence):
             raise ValueError("Codons must be of the same length.")
 
-        differences = []
-        for i in range(len(self.sequence)):
-            if self.sequence[i] != other.sequence[i]:
-                nucleotid_ref = f"{self.sequence[i].lower()}"
-                nucleotid_sample = f"{other.sequence[i].lower()}"
-                nucleotid_position = f"{self.position + i + 1}"
-                difference = (
-                    f"{nucleotid_ref}{nucleotid_position}{nucleotid_sample}"
-                )
-                differences.append(difference)
+        differences = [
+            f"{ref.lower()}{self.position + i + 1}{sample.lower()}"
+            for i, (ref, sample) in enumerate(zip(self.sequence, other.sequence))
+            if ref != sample
+        ]
 
         return tuple(differences)
 
@@ -90,7 +88,7 @@ class Codon:
         Returns:
             str: The single-letter code of the amino acid translated from the codon.
         """
-        return str(Seq(self.sequence).translate())
+        return self.amino_acid
 
 
 class Gene:
@@ -178,7 +176,7 @@ class MutationService:
         genes (List[Gene]): A list of Gene objects representing the genes in the reference genome.
     """
 
-    def __init__(self, seq_reference: SeqRecord):
+    def __init__(self, seq_reference: SeqRecord, print_progress: bool = False):
         """
         Initializes a MutationService object with a reference sequence.
 
@@ -187,6 +185,7 @@ class MutationService:
         """
         self.ref_seq = seq_reference.seq
         self.genes = self.__populate_genes(seq_reference)
+        self._print_progress = print_progress
 
     def __populate_genes(self, sequence: SeqRecord) -> List[Gene]:
         """
@@ -205,7 +204,6 @@ class MutationService:
                 gene_seq = sequence.seq[
                     feature.location.start : feature.location.end
                 ]
-                # print(gene_name, len(gene_seq) / 3) # How many codons in gene.
                 genes.append(Gene(gene_name, gene_seq, feature.location))
         return genes
 
@@ -240,13 +238,14 @@ class MutationService:
                     "unknown": [],
                 }
 
-            print(
-                f"Processing gene: {gene.name}, Numbers of codons: {len(gene.sequence) / 3}"
-            )  # Print gene name an total codons for this gene.
+            if self._print_progress:
+                print(
+                    f"Processing gene: {gene.name}, Numbers of codons: {len(gene.sequence) / 3}"
+                )  # Print gene name an total codons for this gene.
 
             num_codons = len(gene.sequence) // 3
             for i in range(0, len(gene.sequence), 3):
-                if print_progress:
+                if self._print_progress:
                     progress = (i // 3) + 1
                     percent_complete = (progress / num_codons) * 100
                     print(
@@ -263,7 +262,6 @@ class MutationService:
                     mutation = Mutation(ref_codon, sample_codon)
                     mutation_type, differences = mutation.annotate()
                     annotations[gene.name][mutation_type].extend(differences)
-        print("")
         return annotations
 
     def analyze_mutations(
@@ -279,32 +277,88 @@ class MutationService:
             Dict[str, Dict[str, List[str]]]: A dictionary where keys are sample IDs and values are dictionaries with
                                              gene names as keys and lists of mutation annotations as values.
         """
-        annotations = {}
+        annotations = {gene.name: {"synonymous": [], "nonsynonymous": [], "unknown": []} for gene in self.genes}
+
         for seq_record_sample in seq_samples:
             if seq_record_sample.id not in annotations:
                 annotations[seq_record_sample.id] = {}
 
             seq_sample = seq_record_sample.seq
-            print(f"Processing sample: {seq_record_sample.id}")
+            if self._print_progress:
+                print(f"Processing sample: {seq_record_sample.id}")
             gene_mutation_details = self.__annotate_gene_mutations(seq_sample)
             annotations[seq_record_sample.id] = gene_mutation_details
 
         return annotations
 
+FORMAT_MAPPING: Dict[str, str] = {'gbk': 'genbank',
+                                  'fasta': 'fasta'}
 
-path_ref_gbk: str = r"referencia.gbk"
-path_muestras_fasta: str = r"muestras.fasta"
+def get_format_for_extension(file_path: str) -> str:
+    """
+    Determine the format type from the file extension.
 
-# Load reference genome
-seq_record_reference: SeqRecord = SeqIO.read(
-    path_ref_gbk, "genbank"
-)  # Unlike FASTA, GenBank provides the specific position for each gene, which is necessary to locate the genes in the sequence.
+    Args:
+        file_path (str): Path to the file.
 
-# Load the sample genomes
-with open(path_muestras_fasta) as sample_file:
-    seq_record_samples = list(SeqIO.parse(sample_file, "fasta"))
+    Returns:
+        str: Format type ('genbank' or 'fasta').
+    """
+    extension: str = file_path.rsplit('.', 1)[-1].lower()
+    if extension in FORMAT_MAPPING:
+        return FORMAT_MAPPING[extension]
+    else:
+        raise ValueError(f"Unsupported file format: {extension}")
 
-# Get report
-mutation_service = MutationService(seq_record_reference)
-mutation_report = mutation_service.analyze_mutations(seq_record_samples)
-print(json.dumps(mutation_report, indent=4))
+def parse_options():
+    parser = argparse.ArgumentParser(description='Genetic Mutation Analyzer')
+    parser.add_argument('--reference-file-path', required=True, help='Path to the reference genome file.')
+    parser.add_argument('--samples-file-path', required=True, help='Path to the sample sequences file.')
+    parser.add_argument('--print-progress', action='store_true', help='Print progress updates during analysis.')
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    # Parse command-line arguments
+    args = parse_options()
+
+    # Attempt to read the reference sequence file
+    try:
+        # Load the reference sequence from the specified file path
+        seq_record_reference = SeqIO.read(
+            args.reference_file_path,
+            get_format_for_extension(args.reference_file_path)
+        )
+    except FileNotFoundError:
+        # Handle the case where the reference file is not found
+        print(f"ERROR: Reference file '{args.reference_file_path}' not found.")
+        sys.exit(1)
+    except Exception as e:
+        # Handle other potential errors when reading the reference file
+        print(f"ERROR: Failed to read reference file '{args.reference_file_path}': {e}")
+        sys.exit(1)
+
+    # Attempt to read the sample sequences file
+    try:
+        # Open and parse the sample sequences file
+        with open(args.samples_file_path) as sample_file:
+            sample_seq_records = list(
+                SeqIO.parse(sample_file, get_format_for_extension(args.samples_file_path))
+            )
+    except FileNotFoundError:
+        # Handle the case where the sample file is not found
+        print(f"ERROR: Samples file '{args.samples_file_path}' not found.")
+        sys.exit(1)
+    except Exception as e:
+        # Handle other potential errors when reading the sample file
+        print(f"ERROR: Failed to read samples file '{args.samples_file_path}': {e}")
+        sys.exit(1)
+
+    # Create a MutationService instance with the loaded reference sequence
+    mutation_service = MutationService(seq_record_reference, args.print_progress)
+
+    # Analyze mutations across all sample sequences
+    mutation_report = mutation_service.analyze_mutations(sample_seq_records)
+
+    # Print the resulting mutation report in a formatted JSON
+    print(json.dumps(mutation_report, indent=4))
