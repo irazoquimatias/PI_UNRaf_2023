@@ -5,7 +5,7 @@ from Bio.SeqRecord import SeqRecord
 from Bio.SeqFeature import SeqFeature, FeatureLocation
 from Bio.Seq import Seq
 from Bio.Data.CodonTable import TranslationError
-from Bio import SeqIO
+from Bio import SeqIO, Align
 import re
 import json
 import sys
@@ -42,27 +42,17 @@ class Codon:
 
         The position of the mutations is always in reference to the parent sequence.
 
-        Nucleotide changes are reported in lowercase letters, while amino acid changes
-        are reported in uppercase letters.
-
-        For example, 'a23g' indicates a nucleotide change from adenine to guanine at position 23,
-        and 'A23G' indicates an amino acid change from alanine to glycine at the corresponding position.
+        For example, 'a23g' indicates a nucleotide change from adenine to guanine at position 23.
 
         If the comparison involves a codon containing a gap ('-'), the method will still
-        return the differences, but such cases are typically classified as 'unknown'
-        because gaps can indicate complex events like insertions or deletions that do not
-        directly correspond to a single nucleotide substitution.
-
-        For example, 'a23-' indicates a nucleotide change from adenine to a gap
-        at position 23, which could suggest a deletion. Such a case would be
-        classified as 'unknown'.
+        return the differences.
 
         Args:
             other (Codon): The other codon to compare with.
 
         Returns:
             Tuple[str]: A tuple containing strings that represent the differences between
-                        the two codons. Each string is formatted as 'nucleotide_position_change'
+                        the two codons.
                         (e.g., 'a12g' for a nucleotide change from 'a' to 'g' at position 12).
 
                         If there are no differences, an empty tuple is returned.
@@ -113,60 +103,6 @@ class Gene:
         self.location = location
 
 
-class Mutation:
-    """
-    Represents a mutation between a reference codon and a sample codon.
-
-    Attributes:
-        ref_codon (Codon): The codon from the reference sequence.
-        sample_codon (Codon): The codon from the sample sequence.
-    """
-
-    def __init__(self, ref_codon: Codon, sample_codon: Codon):
-        """
-        Initializes a Mutation object with reference and sample codons.
-
-        Args:
-            ref_codon (Codon): The codon from the reference sequence.
-            sample_codon (Codon): The codon from the sample sequence.
-        """
-        self.ref_codon = ref_codon
-        self.sample_codon = sample_codon
-
-    def annotate(self) -> Tuple[str, Tuple[str]]:
-        """
-        Annotates the type of mutation and identifies the differences between the reference and sample codons.
-
-        The method classifies mutations as 'synonymous', 'nonsynonymous', or 'unknown'.
-        - Synonymous mutations do not change the amino acid produced by the codon.
-        - Nonsynonymous mutations result in a different amino acid.
-        - 'Unknown' is returned when the sample codon contains a gap ('-'), indicating a potential insertion or deletion event.
-
-        Returns:
-            Tuple[str, Tuple[str]]: A tuple containing:
-                - str: The type of mutation ('synonymous', 'nonsynonymous', or 'unknown').
-                - Tuple[str]: A tuple of strings that describe the differences between the reference and sample codons.
-                            (e.g., 'a12g' for a nucleotide change from 'a' to 'g' at position 12).
-                            (e.g., 'A12G' for an amino acid change from 'A' to 'G' at position 12).
-                            (e.g., 'a12-' for a nucleotide change from 'a' to -' at position 12).
-        """
-        if "-" in self.sample_codon.sequence:
-            nucleotid_differ = self.ref_codon.compare(self.sample_codon)
-            return "unknown", nucleotid_differ
-
-        ref_aminoacid = self.ref_codon.translate()
-        sample_aminoacid = self.sample_codon.translate()
-
-        if ref_aminoacid == sample_aminoacid:
-            nucleotid_differ = self.ref_codon.compare(self.sample_codon)
-            return "synonymous", nucleotid_differ
-        else:
-            aminoacid_differ = (
-                f"{ref_aminoacid}{self.ref_codon.position}{sample_aminoacid}",
-            )
-            return "nonsynonymous", aminoacid_differ
-
-
 class MutationService:
     """
     Service for analyzing mutations between a reference sequence and sample sequences.
@@ -186,6 +122,9 @@ class MutationService:
         self.ref_seq = seq_reference.seq
         self.genes = self.__populate_genes(seq_reference)
         self._print_progress = print_progress
+        self._aligner = Align.PairwiseAligner()
+        self._aligner.mismatch_score = -0.2
+        self._aligner.open_gap_score = -2
 
     def __populate_genes(self, sequence: SeqRecord) -> List[Gene]:
         """
@@ -219,14 +158,15 @@ class MutationService:
 
         Returns:
             Dict[str, List[str]]: A dictionary where keys are gene names and values are lists of mutation annotations
-                                  categorized as 'synonymous', 'nonsynonymous', or 'unknown'.
+                                  categorized as 'synonymous', 'nonsynonymous', 'deletions' and 'insertions'.
 
         Raises:
             ValueError: If the length of the reference sequence and the sample sequence do not match.
         """
+        # Length of reference sequence and sample sequence must be equal.
         if len(self.ref_seq) != len(seq_sample):
             raise ValueError(
-                f"Sequences must be of equal length.\nReference sequence: {self.ref_seq}"
+                f"Sequences must be of equal length.\nReference sequence len: {len(self.ref_seq)}\nSample sequence len: {len(seq_sample)}"
             )
 
         annotations = {}
@@ -235,34 +175,95 @@ class MutationService:
                 annotations[gene.name] = {
                     "synonymous": [],
                     "nonsynonymous": [],
-                    "unknown": [],
+                    "insertions": [],
+                    "deletions": [],
                 }
 
+            # Print progress
             if self._print_progress:
                 print(
                     f"Processing gene: {gene.name}, Numbers of codons: {len(gene.sequence) / 3}"
-                )  # Print gene name an total codons for this gene.
+                )  # Print gene name and total codons for this gene.
 
             num_codons = len(gene.sequence) // 3
-            for i in range(0, len(gene.sequence), 3):
+
+            for pos in range(0, len(gene.sequence), 3): # The position is relative to the gene
+                # Print progress
                 if self._print_progress:
-                    progress = (i // 3) + 1
+                    progress = (pos // 3) + 1
                     percent_complete = (progress / num_codons) * 100
                     print(
                         f"Processing codon {progress}/{num_codons} ({percent_complete:.2f}%)"
                     )
 
-                ref_codon = Codon(gene.sequence[i : i + 3], i)
-                sample_gene_secuence = seq_sample[
+                # Getting sample gene sequence
+                sample_gene_sequence = seq_sample[
                     gene.location.start : gene.location.end
                 ]
-                sample_codon = Codon(sample_gene_secuence[i : i + 3], i)
 
-                if ref_codon.sequence != sample_codon.sequence:
-                    mutation = Mutation(ref_codon, sample_codon)
-                    mutation_type, differences = mutation.annotate()
-                    annotations[gene.name][mutation_type].extend(differences)
+                # Getting codons for mutation calculation.
+                ref_codon = Codon(gene.sequence[pos : pos + 3], pos)
+                ref_codon_next = Codon(gene.sequence[pos + 3 : pos + 6], pos + 3)
+
+                sample_codon = Codon(sample_gene_sequence[pos : pos + 3], pos)
+                sample_codon_next = Codon(sample_gene_sequence[pos + 3 : pos + 6], pos + 3)
+
+                # Start calculating mutations.
+                ## Insertion case
+                if ref_codon_next.sequence == '---':
+                    annotated_insertion = f"{ref_codon.amino_acid}{pos}{sample_codon.amino_acid}{sample_codon_next.amino_acid}"
+                    annotations[gene.name]['insertions'].append(annotated_insertion)
+                    pos = pos + 3
+
+                ## Deletion case
+                elif sample_codon.sequence == '---':
+                    annotated_deletion = f"{pos}{ref_codon.amino_acid}"
+                    annotations[gene.name]['deletions'].append(annotated_deletion)
+
+                ## Synonymous or Nonsynonymous case
+                elif ref_codon.sequence != sample_codon.sequence:
+                    ## Synonymous case
+                    if ref_codon.amino_acid == sample_codon.amino_acid:
+                        nucleotid_differ = ref_codon.compare(sample_codon)
+                        annotations[gene.name]['synonymous'].extend(nucleotid_differ)
+                    ## Nonsynonymous case
+                    else:
+                        aminoacid_differ = (
+                            f"{ref_codon.amino_acid}{ref_codon.position}{sample_codon.amino_acid}",
+                        )
+                        annotations[gene.name]['nonsynonymous'].extend(aminoacid_differ)
+
         return annotations
+
+    def __align_sequences(self, seq_reference: Seq, seq_sample: Seq) -> Seq:
+        """
+        Aligns a sample sequence to the reference sequence using pairwise alignment.
+
+        This method uses the `Align.PairwiseAligner` to align the provided sample sequence to the reference sequence. 
+        It adjusts the reference sequence to match the alignment and returns the aligned sample sequence.
+
+        Args:
+            seq_reference (Seq): The nucleotide sequence of the reference genome.
+            seq_sample (Seq): The nucleotide sequence of the sample to be aligned.
+
+        Returns:
+            Seq: The aligned nucleotide sequence of the sample.
+
+        Raises:
+            ValueError: If the reference and sample sequences are of different lengths.
+        """
+        # Perform the alignment
+        alignments = self._aligner.align(seq_reference, seq_sample)
+        
+        # Extract the first (best) alignment
+        aligned_reference = alignments[0][0]
+        aligned_sample = alignments[0][1]
+        
+        # Update the reference sequence if it has been modified during alignment
+        if self.ref_seq != aligned_reference:
+            self.ref_seq = aligned_reference
+
+        return aligned_sample
 
     def analyze_mutations(
         self, seq_samples: List[SeqRecord]
@@ -277,16 +278,17 @@ class MutationService:
             Dict[str, Dict[str, List[str]]]: A dictionary where keys are sample IDs and values are dictionaries with
                                              gene names as keys and lists of mutation annotations as values.
         """
-        annotations = {gene.name: {"synonymous": [], "nonsynonymous": [], "unknown": []} for gene in self.genes}
-
+        annotations = {}
         for seq_record_sample in seq_samples:
             if seq_record_sample.id not in annotations:
                 annotations[seq_record_sample.id] = {}
 
             seq_sample = seq_record_sample.seq
+            aligned_seq_sample = self.__align_sequences(self.ref_seq, seq_sample)
+            # Print progress
             if self._print_progress:
                 print(f"Processing sample: {seq_record_sample.id}")
-            gene_mutation_details = self.__annotate_gene_mutations(seq_sample)
+            gene_mutation_details = self.__annotate_gene_mutations(aligned_seq_sample)
             annotations[seq_record_sample.id] = gene_mutation_details
 
         return annotations
@@ -317,7 +319,7 @@ def parse_options():
     parser.add_argument('--print-progress', action='store_true', help='Print progress updates during analysis.')
     return parser.parse_args()
 
-
+# Main code
 if __name__ == "__main__":
     # Parse command-line arguments
     args = parse_options()
@@ -354,11 +356,16 @@ if __name__ == "__main__":
         print(f"ERROR: Failed to read samples file '{args.samples_file_path}': {e}")
         sys.exit(1)
 
+    samples_with_gaps = []
+    for seq in sample_seq_records:
+        seq.seq = seq.seq.replace('-', '')
+        samples_with_gaps.append(seq)
+
     # Create a MutationService instance with the loaded reference sequence
     mutation_service = MutationService(seq_record_reference, args.print_progress)
 
     # Analyze mutations across all sample sequences
-    mutation_report = mutation_service.analyze_mutations(sample_seq_records)
+    mutation_report = mutation_service.analyze_mutations(samples_with_gaps)
 
     # Print the resulting mutation report in a formatted JSON
     print(json.dumps(mutation_report, indent=4))
