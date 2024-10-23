@@ -1,19 +1,18 @@
 # This module provides tools for analyzing genetic mutations by comparing reference and sample DNA sequences.
 # It includes classes for representing codons, genes, and mutations, as well as a service for annotating mutations across multiple sample sequences.
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from Bio.SeqRecord import SeqRecord
-from Bio.SeqFeature import SeqFeature, FeatureLocation
+from Bio.SeqFeature import FeatureLocation
 from Bio.Seq import Seq
-from Bio.Data.CodonTable import TranslationError
-from Bio import SeqIO, Align
-import re
+from Bio import SeqIO, Align, BiopythonWarning
 import json
 import sys
 import argparse
-import os
+import warnings
 
 __author__ = "Hernán Bernal"
 
+warnings.filterwarnings("error")
 
 class Codon:
     """
@@ -34,7 +33,27 @@ class Codon:
         """
         self.sequence = sequence
         self.position = position
-        self.amino_acid = str(Seq(sequence).translate())
+
+        with warnings.catch_warnings(): # Handling biopython warnings
+            warnings.simplefilter("error", BiopythonWarning)
+
+            try:
+                self.amino_acid = str(Seq(sequence).translate())
+            except BiopythonWarning as warn:
+                self.amino_acid = None
+            except Exception as e:
+                print(f"Error durante la traducción: {e}")
+                self.amino_acid = None
+
+
+    def __iter__(self):
+        """
+        Makes the Codon class iterable, allowing iteration over the nucleotide sequence.
+
+        Yields:
+            str: Each nucleotide in the codon sequence.
+        """
+        return iter(self.sequence)
 
     def compare(self, other: "Codon") -> Tuple[str]:
         """
@@ -143,6 +162,8 @@ class MutationService:
                 gene_seq = sequence.seq[
                     feature.location.start : feature.location.end
                 ]
+                #print(f"Gene: {gene_name}")
+                #print(f"Start: {feature.location.start}, End: {feature.location.end}, Codons: {(feature.location.end - feature.location.start) / 3}")
                 genes.append(Gene(gene_name, gene_seq, feature.location))
         return genes
 
@@ -184,18 +205,10 @@ class MutationService:
                 print(
                     f"Processing gene: {gene.name}, Numbers of codons: {len(gene.sequence) / 3}"
                 )  # Print gene name and total codons for this gene.
-
             num_codons = len(gene.sequence) // 3
 
-            for pos in range(0, len(gene.sequence), 3): # The position is relative to the gene
-                # Print progress
-                if self._print_progress:
-                    progress = (pos // 3) + 1
-                    percent_complete = (progress / num_codons) * 100
-                    print(
-                        f"Processing codon {progress}/{num_codons} ({percent_complete:.2f}%)"
-                    )
 
+            for pos in range(0, len(gene.sequence), 3): # The position is relative to the gene
                 # Getting sample gene sequence
                 sample_gene_sequence = seq_sample[
                     gene.location.start : gene.location.end
@@ -287,7 +300,7 @@ class MutationService:
             aligned_seq_sample = self.__align_sequences(self.ref_seq, seq_sample)
             # Print progress
             if self._print_progress:
-                print(f"Processing sample: {seq_record_sample.id}")
+                print(f"---\n",f"Processing sample: {seq_record_sample.id}")
             gene_mutation_details = self.__annotate_gene_mutations(aligned_seq_sample)
             annotations[seq_record_sample.id] = gene_mutation_details
 
@@ -356,16 +369,11 @@ if __name__ == "__main__":
         print(f"ERROR: Failed to read samples file '{args.samples_file_path}': {e}")
         sys.exit(1)
 
-    samples_with_gaps = []
-    for seq in sample_seq_records:
-        seq.seq = seq.seq.replace('-', '')
-        samples_with_gaps.append(seq)
-
     # Create a MutationService instance with the loaded reference sequence
     mutation_service = MutationService(seq_record_reference, args.print_progress)
 
     # Analyze mutations across all sample sequences
-    mutation_report = mutation_service.analyze_mutations(samples_with_gaps)
+    mutation_report = mutation_service.analyze_mutations(sample_seq_records)
 
     # Print the resulting mutation report in a formatted JSON
-    print(json.dumps(mutation_report, indent=4))
+    #print(json.dumps(mutation_report, indent=4))
